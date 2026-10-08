@@ -1,0 +1,20 @@
+# Local toolchain and build outputs
+.tools/
+.docwork/
+dist/
+*.exe
+*.zip
+
+# Site configuration and private runtime data
+/devices.csv
+/links.csv
+credentials.dat
+logs/
+*.log
+.env
+.env.*
+
+# Editor temporary files
+~$*
+*.tmp
+*.bak
