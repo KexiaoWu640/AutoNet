@@ -78,6 +78,8 @@ build.bat
 
 脚本检查 Go 版本，执行测试，再生成 `dist\AutoNet.exe`、`dist\AutoNet-debug.exe` 和 `dist\walk-smoke.exe`。已有现场 CSV 不会被覆盖；首次构建复制示例 CSV，使用前需修改。
 
+仓库 `release/` 目录提供已编译好的正式版 `AutoNet.exe`，下载后与现场 `devices.csv`、`links.csv` 放在同一文件夹即可使用；同目录 `SHA256SUMS.txt` 给出该文件的 SHA-256 校验值。该二进制由 `build.bat` 用 Go 1.20.14 从本仓库源码编译，可执行文件内记录的 `vcs.revision` 与提交号一致，可据此核对来源。
+
 也可手动执行：
 
 ```bat
