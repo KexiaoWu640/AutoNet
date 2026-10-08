@@ -118,4 +118,4 @@ AutoNet-debug.exe input-test
 - SSH 支持旧设备算法，当前不校验主机密钥；请在可信管理网络使用。
 - 不同机型的命令和输出仍需现场确认。自动测试通过不等同于完成现场验收。
 
-简明操作说明见 [Word 使用说明](docs/AutoNet使用说明.docx)。
+简明操作说明见 [Word 使用说明](docs/AutoNet使用说明.docx)，实现细节见 [技术文档](docs/AutoNet技术文档.md)。
