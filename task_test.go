@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"strings"
 	"testing"
@@ -102,5 +105,41 @@ func TestTraceTopology(t *testing.T) {
 	}
 	if len(result.Hops) != 3 {
 		t.Fatalf("hops = %d", len(result.Hops))
+	}
+}
+
+func TestCancelStopsNextHop(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := Device{ID: "A", IP: "192.0.2.1", Type: "h3c"}
+	b := Device{ID: "B", IP: "192.0.2.2", Type: "h3c"}
+	calls := 0
+	r := &TaskRunner{Context: ctx, Config: &AppConfig{
+		Devices: map[string]Device{"A": a, "B": b},
+		Links:   map[string]string{"A|GE1/0/1": "B"},
+	}, RunCommands: func(Device, string, string, []string) (string, error) {
+		calls++
+		cancel()
+		return "aabb-ccdd-eeff 9 Learned GE1/0/1", nil
+	}}
+	_, err := r.trace(a, "aabb-ccdd-eeff", "admin", "password", func(string) {}, log.New(io.Discard, "", 0))
+	if !errors.Is(err, context.Canceled) || calls != 1 {
+		t.Fatalf("err=%v, command calls=%d", err, calls)
+	}
+}
+
+func TestCancelInterruptsARPRetryDelay(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &TaskRunner{Context: ctx}
+	done := make(chan error, 1)
+	go func() { done <- r.pause(time.Minute) }()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("retry delay did not stop")
 	}
 }

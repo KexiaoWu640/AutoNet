@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -44,6 +45,7 @@ func (r TaskResult) StatusText() string {
 type CommandRunner func(Device, string, string, []string) (string, error)
 
 type TaskRunner struct {
+	Context     context.Context
 	LogCreated  func(string)
 	Config      *AppConfig
 	RunCommands CommandRunner
@@ -52,12 +54,53 @@ type TaskRunner struct {
 }
 
 func NewTaskRunner(config *AppConfig, baseDir string) *TaskRunner {
+	return NewTaskRunnerContext(context.Background(), config, baseDir)
+}
+
+func NewTaskRunnerContext(ctx context.Context, config *AppConfig, baseDir string) *TaskRunner {
 	sshClient := NewSSHClient()
-	return &TaskRunner{Config: config, RunCommands: sshClient.RunCommands, LogDir: filepath.Join(baseDir, "logs"), Sleep: time.Sleep}
+	return &TaskRunner{Context: ctx, Config: config, RunCommands: func(d Device, u, p string, commands []string) (string, error) {
+		return sshClient.RunCommandsContext(ctx, d, u, p, commands)
+	}, LogDir: filepath.Join(baseDir, "logs")}
+}
+
+func (r *TaskRunner) context() context.Context {
+	if r.Context != nil {
+		return r.Context
+	}
+	return context.Background()
+}
+
+func (r *TaskRunner) execute(d Device, u, p string, commands []string) (string, error) {
+	if err := r.context().Err(); err != nil {
+		return "", err
+	}
+	return r.RunCommands(d, u, p, commands)
+}
+
+func (r *TaskRunner) pause(duration time.Duration) error {
+	if err := r.context().Err(); err != nil {
+		return err
+	}
+	if r.Sleep != nil {
+		r.Sleep(duration)
+		return r.context().Err()
+	}
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-r.context().Done():
+		return r.context().Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (r *TaskRunner) Run(input TaskInput, emit func(string)) (TaskResult, error) {
 	var result TaskResult
+	if err := r.context().Err(); err != nil {
+		return result, err
+	}
 	input.Username, input.Password = PrepareCredentials(input.Username, input.Password)
 	mac, err := NormalizeMAC(input.MAC)
 	if err != nil {
@@ -97,7 +140,7 @@ func (r *TaskRunner) Run(input TaskInput, emit func(string)) (TaskResult, error)
 		for i, command := range verifyCommands {
 			logger.Printf("验证命令: %s", command)
 			var readErr error
-			outputs[i], readErr = r.RunCommands(result.FinalDevice, input.Username, input.Password, []string{command})
+			outputs[i], readErr = r.execute(result.FinalDevice, input.Username, input.Password, []string{command})
 			logger.Printf("验证原始返回:\n%s\n技术错误: %v", outputs[i], readErr)
 			if readErr != nil || HasCLIError(outputs[i]) {
 				return nil, fmt.Errorf("读取配置失败：%s", result.FinalDevice.ID)
@@ -125,7 +168,7 @@ func (r *TaskRunner) Run(input TaskInput, emit func(string)) (TaskResult, error)
 		}
 		logger.Printf("最终设备: %s %s\n最终端口: %s", result.FinalDevice.ID, result.FinalDevice.IP, result.FinalPort)
 		logger.Printf("发送配置命令:\n%s", strings.Join(commands, "\n"))
-		output, err := r.RunCommands(result.FinalDevice, input.Username, input.Password, commands)
+		output, err := r.execute(result.FinalDevice, input.Username, input.Password, commands)
 		logger.Printf("配置原始返回:\n%s", output)
 		if err != nil {
 			logger.Printf("配置技术错误: %v", err)
@@ -149,7 +192,7 @@ func (r *TaskRunner) Run(input TaskInput, emit func(string)) (TaskResult, error)
 		saveCommand = "save force"
 	}
 	logger.Printf("保存命令: %s", saveCommand)
-	saveOutput, saveErr := r.RunCommands(result.FinalDevice, input.Username, input.Password, []string{saveCommand})
+	saveOutput, saveErr := r.execute(result.FinalDevice, input.Username, input.Password, []string{saveCommand})
 	logger.Printf("保存原始返回:\n%s\n技术错误: %v", saveOutput, saveErr)
 	if saveErr != nil || !SaveSucceeded(saveOutput) {
 		return result, fmt.Errorf("配置已生效，但保存失败或未收到保存成功确认，请查看日志")
@@ -158,9 +201,11 @@ func (r *TaskRunner) Run(input TaskInput, emit func(string)) (TaskResult, error)
 
 	arpCommand := []string{"display arp | include " + mac}
 	for attempt := 1; attempt <= 2; attempt++ {
-		r.Sleep(2 * time.Second)
+		if err := r.pause(2 * time.Second); err != nil {
+			return result, err
+		}
 		logger.Printf("ARP验证第%d次，发送命令: %s", attempt, arpCommand[0])
-		arpOutput, arpErr := r.RunCommands(start, input.Username, input.Password, arpCommand)
+		arpOutput, arpErr := r.execute(start, input.Username, input.Password, arpCommand)
 		logger.Printf("ARP原始返回（第%d次）:\n%s", attempt, arpOutput)
 		if arpErr != nil {
 			logger.Printf("ARP技术错误（第%d次）: %v", attempt, arpErr)
@@ -187,12 +232,12 @@ func (r *TaskRunner) trace(start Device, mac, username, password string, emit fu
 		}
 		emit(fmt.Sprintf("[%d/5] 正在查询 %s %s", hop, current.Name, current.IP))
 		command := "display mac-address " + mac
-		logger.Printf("第%d跳\n设备ID: %s\nIP: %s\n发送命令: %s", hop, current.ID, current.IP, command)
-		output, err := r.RunCommands(current, username, password, []string{command})
+		logger.Printf("第%d跳\n设备ID: %s\nIP: %s\n准备执行命令: %s", hop, current.ID, current.IP, command)
+		output, err := r.execute(current, username, password, []string{command})
 		logger.Printf("设备原始返回:\n%s", output)
 		if err != nil {
 			logger.Printf("SSH技术错误: %v", err)
-			return result, fmt.Errorf("SSH连接失败：%s", current.IP)
+			return result, fmt.Errorf("设备 %s 执行失败：%w", current.IP, err)
 		}
 		port, err := ParseMACPort(output, mac)
 		if err != nil {

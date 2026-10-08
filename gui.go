@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
-	"os/exec"
+	"io"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,13 +25,31 @@ func RunGUI(config *AppConfig, baseDir string) error {
 	var accountPanel *walk.Composite
 	var accountToggle, logButton *walk.PushButton
 	latestLog := ""
-	running := false
-	runner := NewTaskRunner(config, baseDir)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var closing int32
+	var taskDone <-chan struct{}
+	var filterTimer *time.Timer
+	var filterGeneration uint64
+	var logWindow *walk.Dialog
+	var uiMu sync.Mutex
+	syncUI := func(f func()) {
+		uiMu.Lock()
+		defer uiMu.Unlock()
+		if atomic.LoadInt32(&closing) != 0 {
+			return
+		}
+		mw.Synchronize(func() {
+			if atomic.LoadInt32(&closing) == 0 {
+				f()
+			}
+		})
+	}
+	runner := NewTaskRunnerContext(ctx, config, baseDir)
 	credentialPath := filepath.Join(baseDir, "credentials.dat")
-	accounts, accountErr := LoadCredentials(credentialPath)
+	var accounts []SavedCredential
 	var ids []string
 	updatingDevices := false
-	keepText, keepFrom, keepTo, keepTyped := "", 0, 0, false
 	deviceNames := func(query string) []string {
 		ids = SearchDevices(config.Devices, query)
 		names := make([]string, len(ids))
@@ -96,7 +118,7 @@ func RunGUI(config *AppConfig, baseDir string) error {
 					}
 					devices.SetCurrentIndex(selected)
 					updatingDevices = false
-					keepTyped = false
+					filterGeneration++
 					appendStatus(fmt.Sprintf("CSV 已重新加载：%d 台设备，%d 条链路", len(updated.Devices), len(updated.Links)))
 				}},
 				Label{Text: "MAC", MinSize: labelSize},
@@ -109,7 +131,7 @@ func RunGUI(config *AppConfig, baseDir string) error {
 				LineEdit{AssignTo: &username, Text: "admin", StretchFactor: 1},
 				Label{Text: "密码"},
 				LineEdit{AssignTo: &password, PasswordMode: true, StretchFactor: 1},
-				PushButton{AssignTo: &accountToggle, Text: "已存账号 ▾", MinSize: buttonSize, MaxSize: buttonSize, OnClicked: func() {
+				PushButton{AssignTo: &accountToggle, Text: "已存账号 ▾", Enabled: false, MinSize: buttonSize, MaxSize: buttonSize, OnClicked: func() {
 					expanded := !accountPanel.Visible()
 					accountPanel.SetVisible(expanded)
 					if expanded {
@@ -196,14 +218,16 @@ func RunGUI(config *AppConfig, baseDir string) error {
 					summary.SetTextColor(walk.RGB(37, 99, 180))
 					latestLog = ""
 					logButton.SetEnabled(false)
-					running = true
 					start.SetEnabled(false)
 					reload.SetEnabled(false)
 					appendStatus(FormatTaskStart(config.Devices[deviceID], m, v, u))
 					began := time.Now()
+					done := make(chan struct{})
+					taskDone = done
 					go func() {
-						result, runErr := runner.Run(input, func(s string) { mw.Synchronize(func() { appendStatus(s) }) })
-						mw.Synchronize(func() {
+						defer close(done)
+						result, runErr := runner.Run(input, func(s string) { syncUI(func() { appendStatus(s) }) })
+						syncUI(func() {
 							if runErr != nil {
 								summary.SetText("未完成 · 请查看运行记录")
 								summary.SetTextColor(walk.RGB(164, 66, 38))
@@ -214,11 +238,10 @@ func RunGUI(config *AppConfig, baseDir string) error {
 								appendStatus(FormatTaskResult(result, time.Since(began)))
 							}
 							if latestLog != "" {
-								appendStatus("完整日志已保存：" + latestLog + "\n点击「查看日志」可用记事本打开")
+								appendStatus("完整日志已保存：" + latestLog + "\n点击「查看日志」可在程序内打开")
 							} else {
 								appendStatus("本次未生成日志")
 							}
-							running = false
 							start.SetEnabled(true)
 							reload.SetEnabled(true)
 						})
@@ -233,12 +256,27 @@ func RunGUI(config *AppConfig, baseDir string) error {
 						if latestLog == "" {
 							return
 						}
-						cmd := exec.Command("notepad.exe", latestLog)
-						if err := cmd.Start(); err != nil {
-							showError(fmt.Errorf("无法打开日志：%w", err))
-							return
-						}
-						go func() { _ = cmd.Wait() }()
+						path := latestLog
+						go func() {
+							text, err := readLogPreview(path)
+							syncUI(func() {
+								if err != nil {
+									showError(err)
+									return
+								}
+								if logWindow != nil && !logWindow.IsDisposed() {
+									logWindow.Dispose()
+								}
+								err := (Dialog{AssignTo: &logWindow, Title: "运行日志", Size: Size{Width: 800, Height: 600}, Layout: VBox{}, Children: []Widget{
+									TextEdit{ReadOnly: true, VScroll: true, Text: text},
+								}}).Create(mw)
+								if err != nil {
+									showError(err)
+									return
+								}
+								logWindow.Show()
+							})
+						}()
 					}},
 				}},
 				TextEdit{AssignTo: &status, ReadOnly: true, VScroll: true, StretchFactor: 1, MinSize: Size{Height: 170}, TextColor: walk.RGB(47, 64, 82), Background: SolidColorBrush{Color: walk.RGB(255, 255, 255)}, Font: Font{Family: "Microsoft YaHei", PointSize: 10}},
@@ -249,7 +287,7 @@ func RunGUI(config *AppConfig, baseDir string) error {
 		return err
 	}
 	runner.LogCreated = func(path string) {
-		mw.Synchronize(func() {
+		syncUI(func() {
 			latestLog = path
 			logButton.SetEnabled(true)
 		})
@@ -258,61 +296,105 @@ func RunGUI(config *AppConfig, baseDir string) error {
 		if updatingDevices {
 			return
 		}
+		filterGeneration++
+		generation := filterGeneration
+		if filterTimer != nil {
+			filterTimer.Stop()
+		}
 		query := devices.Text()
 		// A list selection is not a new search; preserve all current matches.
 		if i := devices.CurrentIndex(); i >= 0 && i < len(ids) && query == DeviceLabel(config.Devices[ids[i]]) {
-			keepTyped = false
 			return
 		}
 		from, to := devices.TextSelection()
-		keepText, keepFrom, keepTo, keepTyped = query, from, to, true
-		updatingDevices = true
-		devices.SetModel(deviceNames(query))
-		devices.SetCurrentIndex(-1)
-		devices.SetText(query)
-		devices.SetTextSelection(from, to)
-		updatingDevices = false
-	})
-	devices.CurrentIndexChanged().Attach(func() {
-		if !updatingDevices {
-			keepTyped = false
-		}
-	})
-	// Walk moves an editable ComboBox caret to 0 after every resize, and
-	// filtering resizes it (the drop-down height follows the item count), so
-	// capture the typed text and caret first and put them back afterwards.
-	devices.SizeChanged().Attach(func() {
-		if !keepTyped {
-			return
-		}
-		// The native control may already have reset the caret to 0 by now;
-		// only trust a non-zero position, else keep the one from the last edit.
-		if from, to := devices.TextSelection(); devices.Text() == keepText && to > 0 {
-			keepFrom, keepTo = from, to
-		}
-		mw.Synchronize(func() {
-			if !keepTyped {
-				return
-			}
-			updatingDevices = true
-			if devices.Text() != keepText {
-				devices.SetText(keepText)
-			}
-			devices.SetTextSelection(keepFrom, keepTo)
-			updatingDevices = false
+		filterTimer = time.AfterFunc(150*time.Millisecond, func() {
+			syncUI(func() {
+				if generation != filterGeneration || devices.Text() != query {
+					return
+				}
+				matches := SearchDevices(config.Devices, query)
+				if sameDeviceIDs(ids, matches) {
+					return
+				}
+				updatingDevices = true
+				mw.SetSuspended(true)
+				devices.SetModel(deviceNames(query))
+				devices.SetCurrentIndex(-1)
+				devices.SetText(query)
+				mw.SetSuspended(false)
+				devices.SetTextSelection(from, to)
+				updatingDevices = false
+				// Restore once after the queued layout, without a SizeChanged loop.
+				syncUI(func() {
+					if generation == filterGeneration && devices.Text() == query {
+						devices.SetTextSelection(from, to)
+					}
+				})
+			})
 		})
 	})
-	mw.Closing().Attach(func(canceled *bool, _ walk.CloseReason) {
-		if running {
-			*canceled = true
-			summary.SetText("任务进行中，请等待当前操作完成")
+	devices.CurrentIndexChanged().Attach(func() {
+		i := devices.CurrentIndex()
+		if !updatingDevices && i >= 0 && i < len(ids) && devices.Text() == DeviceLabel(config.Devices[ids[i]]) {
+			filterGeneration++
+			if filterTimer != nil {
+				filterTimer.Stop()
+			}
 		}
 	})
-	appendStatus(fmt.Sprintf("已加载 %d 台设备、%d 条链路，%d 个已存账号", len(config.Devices), len(config.Links), len(accounts)))
-	if accountErr != nil {
-		appendStatus("已存账号读取失败，请重新保存账号：" + accountErr.Error())
-	}
+	mw.Closing().Attach(func(_ *bool, _ walk.CloseReason) {
+		uiMu.Lock()
+		atomic.StoreInt32(&closing, 1)
+		uiMu.Unlock()
+		if filterTimer != nil {
+			filterTimer.Stop()
+		}
+		cancel()
+		if logWindow != nil && !logWindow.IsDisposed() {
+			logWindow.Dispose()
+		}
+	})
+	appendStatus(fmt.Sprintf("已加载 %d 台设备、%d 条链路", len(config.Devices), len(config.Links)))
+	// DPAPI may wait for Windows profile services. Never block window creation.
+	go func() {
+		loaded, loadErr := LoadCredentials(credentialPath)
+		syncUI(func() {
+			accounts = loaded
+			accountsBox.SetModel(accountNames())
+			accountToggle.SetEnabled(true)
+			if loadErr != nil {
+				appendStatus("已存账号读取失败，请重新保存账号：" + loadErr.Error())
+			} else {
+				appendStatus(fmt.Sprintf("已读取 %d 个已存账号", len(accounts)))
+			}
+		})
+	}()
 	appendStatus("准备就绪。设备框可输入 IP 或设备 ID 筛选；修改 CSV 后点「重载 CSV」")
 	mw.Run()
+	cancel()
+	if taskDone != nil {
+		// Let the worker close its SSH socket and log; never hang exit.
+		select {
+		case <-taskDone:
+		case <-time.After(time.Second):
+		}
+	}
 	return nil
+}
+
+func readLogPreview(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("无法打开日志：%w", err)
+	}
+	defer f.Close()
+	const limit = 1024 * 1024
+	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return "", err
+	}
+	if len(data) > limit {
+		return string(data[:limit]) + "\r\n（预览仅显示前1MB，完整内容在日志文件中）", nil
+	}
+	return string(data), nil
 }
