@@ -5,6 +5,9 @@ dist/
 *.exe
 *.zip
 
+# Shipped release binary, built from this source by build.bat
+!release/AutoNet.exe
+
 # Site configuration and private runtime data
 /devices.csv
 /links.csv
